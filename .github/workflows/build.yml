@@ -8,24 +8,33 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
-        python-version: ["3.7", "3.8", "3.9", "3.10"]
-        exclude:
-          - os: macos-latest
-            python-version: "3.7"
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
     steps:
-      - uses: actions/checkout@v3
-      - uses: actions/setup-python@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
           
       - name: Build and install
         run: python -m pip install .
       
-      - name: Test
+      - name: Test examples
         timeout-minutes: 15
         run: |
-          python -m unittest discover -v --start-directory examples/python --pattern "example*.py"
+          # Run example files directly
+          for example in examples/python/example*.py; do
+            echo "Running example: $example"
+            python "$example"
+            echo "---------------------------------------"
+          done
+        shell: bash
+
+      - name: Test bindings
+        timeout-minutes: 15
+        run: |
+          # Run the unittest tests
           python -m unittest discover -v --start-directory tests/python --pattern "bindings_test*.py"
+        shell: bash
   
   test_cpp:
     runs-on: ${{ matrix.os }}
@@ -33,10 +42,10 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v3
-      - uses: actions/setup-python@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          python-version: "3.11"
 
       - name: Build
         run: |
