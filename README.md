@@ -3,6 +3,14 @@ Header-only C++ HNSW implementation with python bindings, insertions and updates
 
 **NEWS:**
 
+**version 0.9.0**
+
+* Fixed incorrect results in bruteforce search with filter (#514) by [@lukaszsmolinski](https://github.com/lukaszsmolinski)
+* Fixed missing normalization check in BFIndex (#514) by [@lukaszsmolinski](https://github.com/lukaszsmolinski)
+* Throw an exception when fewer than k elements are available (#514) by [@lukaszsmolinski](https://github.com/lukaszsmolinski)
+* Remove unused variable (#531) by [@lulyon](https://github.com/lulyon)
+* Change cosine similarity to distance in README by [@yurymalkov](https://github.com/yurymalkov)
+
 **version 0.8.0** 
 
 * Multi-vector document search and epsilon search (for now, only in C++)
