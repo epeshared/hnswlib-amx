@@ -142,6 +142,26 @@ inline std::vector<size_t> get_input_ids_and_check_shapes(const py::object& ids_
 }
 
 
+inline py::dict search_profile_to_dict(
+        const hnswlib::SearchProfileStats& aggregate_stats,
+        const std::vector<hnswlib::SearchProfileStats>& per_query_stats) {
+    std::vector<size_t> per_query_distance_computations(per_query_stats.size());
+    std::vector<size_t> per_query_base_layer_expansions(per_query_stats.size());
+    for (size_t i = 0; i < per_query_stats.size(); i++) {
+        per_query_distance_computations[i] = per_query_stats[i].total_distance_computations;
+        per_query_base_layer_expansions[i] = per_query_stats[i].base_layer_expansion_count;
+    }
+
+    return py::dict(
+        "total_distance_computations"_a = aggregate_stats.total_distance_computations,
+        "total_base_layer_expansions"_a = aggregate_stats.base_layer_expansion_count,
+        "candidate_count_histogram"_a = py::cast(aggregate_stats.candidate_count_histogram),
+        "contiguous_run_length_histogram"_a = py::cast(aggregate_stats.contiguous_run_length_histogram),
+        "per_query_distance_computations"_a = py::cast(per_query_distance_computations),
+        "per_query_base_layer_expansions"_a = py::cast(per_query_base_layer_expansions));
+}
+
+
 template<typename dist_t, typename data_t = float>
 class Index {
  public:
@@ -211,6 +231,48 @@ class Index {
       default_ef = ef;
       if (appr_alg)
           appr_alg->ef_ = ef;
+    }
+
+
+    void set_bf16_rowmajor_batch_distance(bool enabled) {
+        if (!index_inited) {
+            throw std::runtime_error("The index is not initiated.");
+        }
+        if (space_name != "ip" && space_name != "cosine") {
+            throw std::runtime_error("BF16 row-major batch distance is only supported for ip and cosine spaces.");
+        }
+        appr_alg->setBf16RowmajorBatchDistance(enabled);
+    }
+
+
+    bool get_bf16_rowmajor_batch_distance() const {
+        return index_inited && appr_alg->getBf16RowmajorBatchDistance();
+    }
+
+
+    void release_fp32_vector_storage() {
+        if (!index_inited) {
+            throw std::runtime_error("The index is not initiated.");
+        }
+        appr_alg->releaseFp32VectorStorage();
+    }
+
+
+    bool is_fp32_vectors_released() const {
+        return index_inited && appr_alg->isFp32VectorsReleased();
+    }
+
+
+    void set_amx_bf16(bool enabled) {
+        if (!index_inited) {
+            throw std::runtime_error("The index is not initiated.");
+        }
+        appr_alg->setAmxBf16(enabled);
+    }
+
+
+    bool get_amx_bf16() const {
+        return index_inited && appr_alg->getAmxBf16();
     }
 
 
@@ -697,6 +759,99 @@ class Index {
     }
 
 
+    py::object knnQueryProfiled_return_numpy(
+        py::object input,
+        size_t k = 1,
+        int num_threads = -1,
+        const std::function<bool(hnswlib::labeltype)>& filter = nullptr) {
+        py::array_t < dist_t, py::array::c_style | py::array::forcecast > items(input);
+        auto buffer = items.request();
+        hnswlib::labeltype* data_numpy_l;
+        dist_t* data_numpy_d;
+        size_t rows, features;
+
+        if (num_threads <= 0)
+            num_threads = num_threads_default;
+
+        std::vector<hnswlib::SearchProfileStats> per_query_stats;
+
+        {
+            py::gil_scoped_release l;
+            get_input_array_shapes(buffer, &rows, &features);
+
+            if (rows <= num_threads * 4) {
+                num_threads = 1;
+            }
+
+            data_numpy_l = new hnswlib::labeltype[rows * k];
+            data_numpy_d = new dist_t[rows * k];
+            per_query_stats.resize(rows);
+
+            CustomFilterFunctor idFilter(filter);
+            CustomFilterFunctor* p_idFilter = filter ? &idFilter : nullptr;
+
+            if (normalize == false) {
+                ParallelFor(0, rows, num_threads, [&](size_t row, size_t threadId) {
+                    std::priority_queue<std::pair<dist_t, hnswlib::labeltype >> result = appr_alg->searchKnnProfiled(
+                        (void*)items.data(row), k, per_query_stats[row], p_idFilter);
+                    if (result.size() != k)
+                        throw std::runtime_error(
+                            "Cannot return the results in a contiguous 2D array. Probably ef or M is too small");
+                    for (int i = k - 1; i >= 0; i--) {
+                        auto& result_tuple = result.top();
+                        data_numpy_d[row * k + i] = result_tuple.first;
+                        data_numpy_l[row * k + i] = result_tuple.second;
+                        result.pop();
+                    }
+                });
+            } else {
+                std::vector<float> norm_array(num_threads * features);
+                ParallelFor(0, rows, num_threads, [&](size_t row, size_t threadId) {
+                    size_t start_idx = threadId * dim;
+                    normalize_vector((float*)items.data(row), (norm_array.data() + start_idx));
+
+                    std::priority_queue<std::pair<dist_t, hnswlib::labeltype >> result = appr_alg->searchKnnProfiled(
+                        (void*)(norm_array.data() + start_idx), k, per_query_stats[row], p_idFilter);
+                    if (result.size() != k)
+                        throw std::runtime_error(
+                            "Cannot return the results in a contiguous 2D array. Probably ef or M is too small");
+                    for (int i = k - 1; i >= 0; i--) {
+                        auto& result_tuple = result.top();
+                        data_numpy_d[row * k + i] = result_tuple.first;
+                        data_numpy_l[row * k + i] = result_tuple.second;
+                        result.pop();
+                    }
+                });
+            }
+        }
+
+        hnswlib::SearchProfileStats aggregate_stats;
+        for (const auto& stats : per_query_stats) {
+            aggregate_stats.merge(stats);
+        }
+
+        py::capsule free_when_done_l(data_numpy_l, [](void* f) {
+            delete[] f;
+            });
+        py::capsule free_when_done_d(data_numpy_d, [](void* f) {
+            delete[] f;
+            });
+
+        return py::make_tuple(
+            py::array_t<hnswlib::labeltype>(
+                { rows, k },
+                { k * sizeof(hnswlib::labeltype), sizeof(hnswlib::labeltype) },
+                data_numpy_l,
+                free_when_done_l),
+            py::array_t<dist_t>(
+                { rows, k },
+                { k * sizeof(dist_t), sizeof(dist_t) },
+                data_numpy_d,
+                free_when_done_d),
+            search_profile_to_dict(aggregate_stats, per_query_stats));
+    }
+
+
     void markDeleted(size_t label) {
         appr_alg->markDelete(label);
     }
@@ -951,6 +1106,12 @@ PYBIND11_PLUGIN(hnswlib) {
             py::arg("k") = 1,
             py::arg("num_threads") = -1,
             py::arg("filter") = py::none())
+        .def("knn_query_profiled",
+            &Index<float>::knnQueryProfiled_return_numpy,
+            py::arg("data"),
+            py::arg("k") = 1,
+            py::arg("num_threads") = -1,
+            py::arg("filter") = py::none())
         .def("add_items",
             &Index<float>::addItems,
             py::arg("data"),
@@ -960,6 +1121,12 @@ PYBIND11_PLUGIN(hnswlib) {
         .def("get_items", &Index<float>::getData, py::arg("ids") = py::none(), py::arg("return_type") = "numpy")
         .def("get_ids_list", &Index<float>::getIdsList)
         .def("set_ef", &Index<float>::set_ef, py::arg("ef"))
+        .def("set_bf16_rowmajor_batch_distance", &Index<float>::set_bf16_rowmajor_batch_distance, py::arg("enabled") = true)
+        .def("get_bf16_rowmajor_batch_distance", &Index<float>::get_bf16_rowmajor_batch_distance)
+        .def("release_fp32_vector_storage", &Index<float>::release_fp32_vector_storage)
+        .def("is_fp32_vectors_released", &Index<float>::is_fp32_vectors_released)
+        .def("set_amx_bf16", &Index<float>::set_amx_bf16, py::arg("enabled") = true)
+        .def("get_amx_bf16", &Index<float>::get_amx_bf16)
         .def("set_num_threads", &Index<float>::set_num_threads, py::arg("num_threads"))
         .def("index_file_size", &Index<float>::indexFileSize)
         .def("save_index", &Index<float>::saveIndex, py::arg("path_to_index"))

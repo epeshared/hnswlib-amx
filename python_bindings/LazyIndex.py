@@ -8,6 +8,7 @@ class LazyIndex(hnswlib.Index):
         self.init_max_elements=max_elements
         self.init_ef_construction=ef_construction
         self.init_M=M
+        self._use_bf16_rowmajor_batch_distance=False
     def init_index(self, max_elements=0,M=0,ef_construction=0):
         if max_elements>0:
             self.init_max_elements=max_elements
@@ -16,6 +17,8 @@ class LazyIndex(hnswlib.Index):
         if M>0:
             self.init_M=M
         super().init_index(self.init_max_elements, self.init_M, self.init_ef_construction)
+        if self._use_bf16_rowmajor_batch_distance:
+            super().set_bf16_rowmajor_batch_distance(True)
     def add_items(self, data, ids=None, num_threads=-1):
         if self.max_elements==0:
             self.init_index()
@@ -28,6 +31,10 @@ class LazyIndex(hnswlib.Index):
         if self.max_elements==0:
             return [], []
         return super().knn_query(data, k, num_threads)
+    def knn_query_profiled(self, data, k=1, num_threads=-1, filter=None):
+        if self.max_elements==0:
+            return [], [], {}
+        return super().knn_query_profiled(data, k, num_threads, filter)
     def resize_index(self, size):
         if self.max_elements==0:
             return self.init_index(size)
@@ -38,6 +45,32 @@ class LazyIndex(hnswlib.Index):
             self.init_ef_construction=ef
             return
         super().set_ef(ef)
+    def set_bf16_rowmajor_batch_distance(self, enabled=True):
+        self._use_bf16_rowmajor_batch_distance=enabled
+        if self.max_elements==0:
+            return
+        super().set_bf16_rowmajor_batch_distance(enabled)
+    def get_bf16_rowmajor_batch_distance(self):
+        if self.max_elements==0:
+            return self._use_bf16_rowmajor_batch_distance
+        return super().get_bf16_rowmajor_batch_distance()
+    def release_fp32_vector_storage(self):
+        if self.max_elements==0:
+            raise RuntimeError("Index is not initialized")
+        super().release_fp32_vector_storage()
+    def is_fp32_vectors_released(self):
+        if self.max_elements==0:
+            return False
+        return super().is_fp32_vectors_released()
+    def set_amx_bf16(self, enabled=True):
+        if self.max_elements==0:
+            self._use_amx_bf16 = enabled
+        else:
+            super().set_amx_bf16(enabled)
+    def get_amx_bf16(self):
+        if self.max_elements==0:
+            return getattr(self, '_use_amx_bf16', False)
+        return super().get_amx_bf16()
     def get_max_elements(self):
         return self.max_elements
     def get_current_count(self):

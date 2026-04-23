@@ -94,6 +94,27 @@ if(HNSWLIB_EXAMPLES)
     add_executable(searchKnnWithFilter_test tests/cpp/searchKnnWithFilter_test.cpp)
     target_link_libraries(searchKnnWithFilter_test hnswlib)
 
+    add_executable(searchProfile_test tests/cpp/searchProfile_test.cpp)
+    target_link_libraries(searchProfile_test hnswlib)
+
+    add_executable(bf16_batch_distance_test tests/cpp/bf16_batch_distance_test.cpp)
+    target_link_libraries(bf16_batch_distance_test hnswlib)
+
+    add_executable(bf16_recall_test tests/cpp/bf16_recall_test.cpp)
+    target_link_libraries(bf16_recall_test hnswlib)
+
+    add_executable(bf16_avx512_bench tests/cpp/bf16_avx512_bench.cpp)
+    target_link_libraries(bf16_avx512_bench hnswlib)
+
+    add_executable(bf16_release_fp32_test tests/cpp/bf16_release_fp32_test.cpp)
+    target_link_libraries(bf16_release_fp32_test hnswlib)
+
+    add_executable(amx_bf16_recall_test tests/cpp/amx_bf16_recall_test.cpp)
+    target_link_libraries(amx_bf16_recall_test hnswlib)
+
+    add_executable(amx_bf16_bench tests/cpp/amx_bf16_bench.cpp)
+    target_link_libraries(amx_bf16_bench hnswlib)
+
     add_executable(multiThreadLoad_test tests/cpp/multiThreadLoad_test.cpp)
     target_link_libraries(multiThreadLoad_test hnswlib)
 

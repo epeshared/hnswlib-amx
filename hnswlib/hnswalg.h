@@ -2,7 +2,9 @@
 
 #include "visited_list_pool.h"
 #include "hnswlib.h"
+#include <algorithm>
 #include <atomic>
+#include <cstdint>
 #include <random>
 #include <stdlib.h>
 #include <assert.h>
@@ -10,9 +12,80 @@
 #include <list>
 #include <memory>
 
+#if defined(__AMX_BF16__)
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
+
 namespace hnswlib {
 typedef unsigned int tableint;
 typedef unsigned int linklistsizeint;
+
+struct SearchProfileStats {
+    size_t total_distance_computations{0};
+    size_t base_layer_expansion_count{0};
+    std::vector<size_t> candidate_count_histogram;
+    std::vector<size_t> contiguous_run_length_histogram;
+
+    void merge(const SearchProfileStats& other) {
+        total_distance_computations += other.total_distance_computations;
+        base_layer_expansion_count += other.base_layer_expansion_count;
+        mergeHistogram(candidate_count_histogram, other.candidate_count_histogram);
+        mergeHistogram(contiguous_run_length_histogram, other.contiguous_run_length_histogram);
+    }
+
+    void recordDistanceComputation(size_t count = 1) {
+        total_distance_computations += count;
+    }
+
+    void recordBaseLayerExpansion(const std::vector<tableint>& candidate_ids) {
+        base_layer_expansion_count++;
+        growHistogram(candidate_count_histogram, candidate_ids.size());
+        candidate_count_histogram[candidate_ids.size()]++;
+
+        if (candidate_ids.empty()) {
+            return;
+        }
+
+        std::vector<tableint> sorted_ids(candidate_ids);
+        std::sort(sorted_ids.begin(), sorted_ids.end());
+
+        size_t run_length = 1;
+        for (size_t i = 1; i < sorted_ids.size(); i++) {
+            if (sorted_ids[i] == sorted_ids[i - 1]) {
+                continue;
+            }
+            if (sorted_ids[i] == sorted_ids[i - 1] + 1) {
+                run_length++;
+                continue;
+            }
+            recordContiguousRun(run_length);
+            run_length = 1;
+        }
+        recordContiguousRun(run_length);
+    }
+
+ private:
+    static void growHistogram(std::vector<size_t>& histogram, size_t bucket) {
+        if (histogram.size() <= bucket) {
+            histogram.resize(bucket + 1, 0);
+        }
+    }
+
+    static void mergeHistogram(std::vector<size_t>& target, const std::vector<size_t>& source) {
+        if (target.size() < source.size()) {
+            target.resize(source.size(), 0);
+        }
+        for (size_t i = 0; i < source.size(); i++) {
+            target[i] += source[i];
+        }
+    }
+
+    void recordContiguousRun(size_t run_length) {
+        growHistogram(contiguous_run_length_histogram, run_length);
+        contiguous_run_length_histogram[run_length]++;
+    }
+};
 
 template<typename dist_t>
 class HierarchicalNSW : public AlgorithmInterface<dist_t> {
@@ -64,6 +137,11 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
     mutable std::atomic<long> metric_distance_computations{0};
     mutable std::atomic<long> metric_hops{0};
+
+    bool use_bf16_rowmajor_batch_distance_ = false;
+    bool fp32_vectors_released_ = false;
+    bool use_amx_bf16_ = false;
+    std::vector<uint16_t> bf16_rowmajor_data_;
 
     bool allow_replace_deleted_ = false;  // flag to replace deleted elements (marked as deleted) during insertions
 
@@ -159,6 +237,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         linkLists_ = nullptr;
         cur_element_count = 0;
         visited_list_pool_.reset(nullptr);
+        bf16_rowmajor_data_.clear();
     }
 
 
@@ -172,6 +251,79 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
     void setEf(size_t ef) {
         ef_ = ef;
+    }
+
+
+    void setBf16RowmajorBatchDistance(bool enabled) {
+        if (!enabled) {
+            if (fp32_vectors_released_) {
+                throw std::runtime_error(
+                    "Cannot disable BF16 mode after FP32 vector storage has been released");
+            }
+            use_bf16_rowmajor_batch_distance_ = false;
+            bf16_rowmajor_data_.clear();
+            return;
+        }
+
+        size_t dim = getDistanceDim();
+        if (data_size_ != dim * sizeof(float)) {
+            throw std::runtime_error("BF16 row-major batch distance requires float vector storage");
+        }
+
+        use_bf16_rowmajor_batch_distance_ = true;
+        rebuildBf16RowmajorData();
+    }
+
+
+    bool getBf16RowmajorBatchDistance() const {
+        return use_bf16_rowmajor_batch_distance_;
+    }
+
+
+    void setAmxBf16(bool enabled) {
+#if defined(__AMX_BF16__)
+        if (enabled) {
+            if (!use_bf16_rowmajor_batch_distance_) {
+                throw std::runtime_error("AMX BF16 requires BF16 row-major batch distance to be enabled first");
+            }
+            if (!requestAmxPermission()) {
+                throw std::runtime_error("Failed to obtain AMX permission from the kernel");
+            }
+        }
+        use_amx_bf16_ = enabled;
+#else
+        if (enabled) {
+            throw std::runtime_error("AMX BF16 is not available (compiled without __AMX_BF16__ support)");
+        }
+#endif
+    }
+
+
+    bool getAmxBf16() const {
+        return use_amx_bf16_;
+    }
+
+
+    bool isFp32VectorsReleased() const {
+        return fp32_vectors_released_;
+    }
+
+
+    // Release FP32 vector storage to save memory.
+    // Requires BF16 mode to be enabled. After this call:
+    //   - Search uses BF16 data only (already the case when BF16 is enabled)
+    //   - addPoint / updatePoint / getData will throw
+    //   - Index can still be saved (links + labels preserved, vectors zeroed)
+    void releaseFp32VectorStorage() {
+        if (!use_bf16_rowmajor_batch_distance_ || bf16_rowmajor_data_.empty()) {
+            throw std::runtime_error(
+                "Cannot release FP32 vectors: BF16 row-major batch distance must be enabled first");
+        }
+        // Zero out vector data in data_level0_memory_, keep links and labels.
+        for (tableint i = 0; i < cur_element_count; i++) {
+            memset(getDataByInternalId(i), 0, data_size_);
+        }
+        fp32_vectors_released_ = true;
     }
 
 
@@ -201,6 +353,306 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
     inline char *getDataByInternalId(tableint internal_id) const {
         return (data_level0_memory_ + internal_id * size_data_per_element_ + offsetData_);
+    }
+
+
+    inline size_t getDistanceDim() const {
+        return *((size_t *)dist_func_param_);
+    }
+
+
+    // Single-pair distance: dispatches to BF16 or FP32 depending on mode.
+    // Used for entry point and upper-level greedy traversal during search.
+    inline dist_t computeDistanceSingle(
+        const void* query_data, tableint internal_id) const {
+        if (use_bf16_rowmajor_batch_distance_ && !bf16_rowmajor_data_.empty()) {
+            const size_t dim = getDistanceDim();
+            // Convert query on the fly (upper-level calls are rare)
+            std::vector<uint16_t> q_bf16(dim);
+            convertFloatVectorToBf16(
+                reinterpret_cast<const float*>(query_data), q_bf16.data(), dim);
+            const uint16_t* cand = bf16_rowmajor_data_.data() + internal_id * dim;
+#if defined(USE_AVX512) && defined(__AVX512BF16__)
+            return static_cast<dist_t>(
+                bf16InnerProductDistanceAVX512BF16(q_bf16.data(), cand, dim));
+#else
+            return static_cast<dist_t>(
+                bf16InnerProductDistanceScalar(q_bf16.data(), cand, dim));
+#endif
+        }
+        return fstdistfunc_(query_data, getDataByInternalId(internal_id), dist_func_param_);
+    }
+
+
+    // Version with pre-converted BF16 query (avoids repeated conversion in loops).
+    inline dist_t computeDistanceSingleBf16Query(
+        const uint16_t* query_bf16, tableint internal_id) const {
+        const size_t dim = getDistanceDim();
+        const uint16_t* cand = bf16_rowmajor_data_.data() + internal_id * dim;
+#if defined(USE_AVX512) && defined(__AVX512BF16__)
+        return static_cast<dist_t>(
+            bf16InnerProductDistanceAVX512BF16(query_bf16, cand, dim));
+#else
+        return static_cast<dist_t>(
+            bf16InnerProductDistanceScalar(query_bf16, cand, dim));
+#endif
+    }
+
+
+    static uint16_t floatToBf16(float value) {
+        uint32_t bits;
+        memcpy(&bits, &value, sizeof(bits));
+        return static_cast<uint16_t>(bits >> 16);
+    }
+
+
+    static float bf16ToFloat(uint16_t value) {
+        uint32_t bits = static_cast<uint32_t>(value) << 16;
+        float result;
+        memcpy(&result, &bits, sizeof(result));
+        return result;
+    }
+
+
+    void convertFloatVectorToBf16(const float* src, uint16_t* dst, size_t dim) const {
+        for (size_t i = 0; i < dim; i++) {
+            dst[i] = floatToBf16(src[i]);
+        }
+    }
+
+
+    void refreshBf16RowmajorElement(tableint internal_id) {
+        if (!use_bf16_rowmajor_batch_distance_) {
+            return;
+        }
+
+        size_t dim = getDistanceDim();
+        const float* src = reinterpret_cast<const float*>(getDataByInternalId(internal_id));
+        uint16_t* dst = bf16_rowmajor_data_.data() + internal_id * dim;
+        convertFloatVectorToBf16(src, dst, dim);
+    }
+
+
+    void rebuildBf16RowmajorData() {
+        if (!use_bf16_rowmajor_batch_distance_) {
+            return;
+        }
+
+        size_t dim = getDistanceDim();
+        bf16_rowmajor_data_.assign(max_elements_ * dim, 0);
+        for (tableint i = 0; i < cur_element_count; i++) {
+            refreshBf16RowmajorElement(i);
+        }
+    }
+
+
+    // Compute BF16 inner-product distance for a single pair.
+    // query_bf16 and candidate_bf16 are both uint16_t[dim] in BF16 format.
+    static float bf16InnerProductDistanceScalar(
+        const uint16_t* query_bf16,
+        const uint16_t* candidate_bf16,
+        size_t dim) {
+        float dot = 0.0f;
+        for (size_t d = 0; d < dim; d++) {
+            dot += bf16ToFloat(query_bf16[d]) * bf16ToFloat(candidate_bf16[d]);
+        }
+        return 1.0f - dot;
+    }
+
+#if defined(USE_AVX512) && defined(__AVX512BF16__)
+    // AVX512-BF16 accelerated inner-product distance using vdpbf16ps.
+    // Requires dim >= 32. Handles residuals for any dim.
+    static float bf16InnerProductDistanceAVX512BF16(
+        const uint16_t* query_bf16,
+        const uint16_t* candidate_bf16,
+        size_t dim) {
+        __m512 acc0 = _mm512_setzero_ps();
+        __m512 acc1 = _mm512_setzero_ps();
+
+        size_t d = 0;
+        // Main loop: process 64 BF16 elements (2x32) per iteration
+        size_t dim64 = dim & ~63ULL;
+        for (; d < dim64; d += 64) {
+            __m512bh q0 = (__m512bh)_mm512_loadu_si512(query_bf16 + d);
+            __m512bh c0 = (__m512bh)_mm512_loadu_si512(candidate_bf16 + d);
+            acc0 = _mm512_dpbf16_ps(acc0, q0, c0);
+
+            __m512bh q1 = (__m512bh)_mm512_loadu_si512(query_bf16 + d + 32);
+            __m512bh c1 = (__m512bh)_mm512_loadu_si512(candidate_bf16 + d + 32);
+            acc1 = _mm512_dpbf16_ps(acc1, q1, c1);
+        }
+        // Handle remaining 32-element chunk
+        if (d + 32 <= dim) {
+            __m512bh q0 = (__m512bh)_mm512_loadu_si512(query_bf16 + d);
+            __m512bh c0 = (__m512bh)_mm512_loadu_si512(candidate_bf16 + d);
+            acc0 = _mm512_dpbf16_ps(acc0, q0, c0);
+            d += 32;
+        }
+        acc0 = _mm512_add_ps(acc0, acc1);
+        float dot = _mm512_reduce_add_ps(acc0);
+
+        // Scalar tail for remaining elements
+        for (; d < dim; d++) {
+            dot += bf16ToFloat(query_bf16[d]) * bf16ToFloat(candidate_bf16[d]);
+        }
+        return 1.0f - dot;
+    }
+#endif
+
+#if defined(__AMX_BF16__)
+    // Request AMX tile permission from the Linux kernel.
+    // Must be called once per process before using AMX tile instructions.
+    static bool requestAmxPermission() {
+        static bool amx_requested = false;
+        static bool amx_granted = false;
+        if (amx_requested) return amx_granted;
+        amx_requested = true;
+        const unsigned long ARCH_REQ_XCOMP_PERM = 0x1023;
+        const unsigned long XFEATURE_XTILEDATA = 18;
+        long ret = syscall(SYS_arch_prctl, ARCH_REQ_XCOMP_PERM, XFEATURE_XTILEDATA);
+        amx_granted = (ret == 0);
+        return amx_granted;
+    }
+
+    // AMX tile config structure — must be 64-byte aligned.
+    struct __attribute__((aligned(64))) AmxTileConfig {
+        uint8_t palette_id;
+        uint8_t start_row;
+        uint8_t reserved[14];
+        uint16_t colsb[16];
+        uint8_t rows[16];
+    };
+
+    // AMX BF16 batch inner-product distance: 1 query × count candidates (count <= 16).
+    //
+    // Swapped-tile layout to avoid expensive vnni repacking:
+    //   Tile A (src1): M=16 rows × 64 bytes = candidates' 32 BF16 elements (row-major)
+    //   Tile B (src2): 16 rows × 4 bytes = query's 32 BF16 as 16 pairs
+    //   Tile C (dst):  M=16 rows × 4 bytes = FP32 dot-product accumulators
+    //
+    // IMPORTANT: Caller must call _tile_loadconfig with the correct AmxTileConfig
+    // before calling this function, and _tile_release after all batches are done.
+    //
+    // candidate_ptrs: array of `count` pointers to BF16 vectors (each dim elements).
+    // distances_out: output array of `count` distances (IP distance = 1 - dot).
+    static void bf16InnerProductBatchAMXCore(
+        const uint16_t* query_bf16,
+        const uint16_t* const* candidate_ptrs,
+        float* distances_out,
+        size_t count,
+        size_t dim)
+    {
+        _tile_zero(2);
+
+        // Contiguous tile A buffer: 16 × 64 bytes = 1 KB, fits in L1 cache.
+        alignas(64) uint8_t tile_a[16 * 64];
+        // Zero-fill unused rows once
+        if (count < 16) {
+            memset(tile_a + count * 64, 0, (16 - count) * 64);
+        }
+
+        // Process dim in chunks of 32 BF16 elements
+        for (size_t d = 0; d + 31 < dim; d += 32) {
+            // Pack tile A: copy each candidate's 64-byte chunk (1 cache line each)
+            for (size_t n = 0; n < count; n++) {
+                memcpy(tile_a + n * 64, candidate_ptrs[n] + d, 64);
+            }
+            _tile_loadd(0, tile_a, 64);
+
+            // Tile B: query's 32 BF16 as 16 rows of 4 bytes (stride=4, contiguous)
+            _tile_loadd(1, query_bf16 + d, 4);
+
+            _tile_dpbf16ps(2, 0, 1);
+        }
+
+        // Handle tail (dim % 32) with scalar
+        size_t dim32 = dim & ~31ULL;
+        float tail_dots[16] = {0};
+        if (dim32 < dim) {
+            for (size_t n = 0; n < count; n++) {
+                for (size_t d = dim32; d < dim; d++) {
+                    tail_dots[n] += bf16ToFloat(query_bf16[d]) * bf16ToFloat(candidate_ptrs[n][d]);
+                }
+            }
+        }
+
+        // Extract results: 16 rows × 1 FP32, stride=4 (contiguous)
+        alignas(64) float tile_c[16];
+        _tile_stored(2, tile_c, 4);
+
+        for (size_t n = 0; n < count; n++) {
+            distances_out[n] = 1.0f - (tile_c[n] + tail_dots[n]);
+        }
+    }
+#endif // __AMX_BF16__
+
+    // Batch distance computation into pre-allocated output buffer.
+    // query_bf16: pre-converted BF16 query vector (dim elements).
+    // candidate_ids: array of candidate internal IDs (count elements).
+    // distances_out: pre-allocated output buffer (count elements).
+    void computeBf16BatchDistancesInto(
+        const uint16_t* query_bf16,
+        const tableint* candidate_ids,
+        dist_t* distances_out,
+        size_t count) const {
+        const size_t dim = getDistanceDim();
+        const uint16_t* bf16_base = bf16_rowmajor_data_.data();
+
+#if defined(__AMX_BF16__)
+        if (use_amx_bf16_) {
+            // Configure AMX tiles once for all batches in this call
+            AmxTileConfig cfg;
+            memset(&cfg, 0, sizeof(cfg));
+            cfg.palette_id = 1;
+            cfg.rows[0] = 16;     cfg.colsb[0] = 64;  // tile A: candidates
+            cfg.rows[1] = 16;     cfg.colsb[1] = 4;   // tile B: query pairs
+            cfg.rows[2] = 16;     cfg.colsb[2] = 4;   // tile C: results
+            _tile_loadconfig(&cfg);
+
+            const uint16_t* cand_ptrs[16];
+            size_t i = 0;
+            for (; i + 16 <= count; i += 16) {
+                for (size_t j = 0; j < 16; j++) {
+                    cand_ptrs[j] = bf16_base + candidate_ids[i + j] * dim;
+                }
+                float amx_dists[16];
+                bf16InnerProductBatchAMXCore(query_bf16, cand_ptrs, amx_dists, 16, dim);
+                for (size_t j = 0; j < 16; j++) {
+                    distances_out[i + j] = static_cast<dist_t>(amx_dists[j]);
+                }
+            }
+            if (i < count) {
+                size_t remain = count - i;
+                for (size_t j = 0; j < remain; j++) {
+                    cand_ptrs[j] = bf16_base + candidate_ids[i + j] * dim;
+                }
+                float amx_dists[16];
+                bf16InnerProductBatchAMXCore(query_bf16, cand_ptrs, amx_dists, remain, dim);
+                for (size_t j = 0; j < remain; j++) {
+                    distances_out[i + j] = static_cast<dist_t>(amx_dists[j]);
+                }
+            }
+
+            _tile_release();
+            return;
+        }
+#endif
+
+        for (size_t i = 0; i < count; i++) {
+            const uint16_t* candidate_bf16 = bf16_base + candidate_ids[i] * dim;
+#ifdef USE_SSE
+            if (i + 1 < count) {
+                _mm_prefetch((const char*)(bf16_base + candidate_ids[i + 1] * dim), _MM_HINT_T0);
+            }
+#endif
+#if defined(USE_AVX512) && defined(__AVX512BF16__)
+            distances_out[i] = static_cast<dist_t>(
+                bf16InnerProductDistanceAVX512BF16(query_bf16, candidate_bf16, dim));
+#else
+            distances_out[i] = static_cast<dist_t>(
+                bf16InnerProductDistanceScalar(query_bf16, candidate_bf16, dim));
+#endif
+        }
     }
 
 
@@ -313,7 +765,8 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         const void *data_point,
         size_t ef,
         BaseFilterFunctor* isIdAllowed = nullptr,
-        BaseSearchStopCondition<dist_t>* stop_condition = nullptr) const {
+        BaseSearchStopCondition<dist_t>* stop_condition = nullptr,
+        SearchProfileStats* search_profile = nullptr) const {
         VisitedList *vl = visited_list_pool_->getFreeVisitedList();
         vl_type *visited_array = vl->mass;
         vl_type visited_array_tag = vl->curV;
@@ -324,12 +777,14 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         dist_t lowerBound;
         if (bare_bone_search || 
             (!isMarkedDeleted(ep_id) && ((!isIdAllowed) || (*isIdAllowed)(getExternalLabel(ep_id))))) {
-            char* ep_data = getDataByInternalId(ep_id);
-            dist_t dist = fstdistfunc_(data_point, ep_data, dist_func_param_);
+            dist_t dist = computeDistanceSingle(data_point, ep_id);
+            if (search_profile) {
+                search_profile->recordDistanceComputation();
+            }
             lowerBound = dist;
             top_candidates.emplace(dist, ep_id);
             if (!bare_bone_search && stop_condition) {
-                stop_condition->add_point_to_result(getExternalLabel(ep_id), ep_data, dist);
+                stop_condition->add_point_to_result(getExternalLabel(ep_id), getDataByInternalId(ep_id), dist);
             }
             candidate_set.emplace(-dist, ep_id);
         } else {
@@ -338,6 +793,26 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         }
 
         visited_array[ep_id] = visited_array_tag;
+
+        // Pre-allocate reusable buffers for the BFS loop (avoid per-expansion heap allocs).
+        const bool use_bf16_batch = use_bf16_rowmajor_batch_distance_ && !bf16_rowmajor_data_.empty();
+        const size_t max_neighbors = maxM0_;  // max neighbors at level 0
+        std::vector<tableint> pending_ids_buf(max_neighbors);
+        std::vector<dist_t> pending_dists_buf(max_neighbors);
+        std::vector<tableint> profiled_ids_buf;
+        if (search_profile) {
+            profiled_ids_buf.resize(max_neighbors);
+        }
+
+        // Cache query BF16 conversion once for the entire search.
+        const size_t dim = use_bf16_batch ? getDistanceDim() : 0;
+        std::vector<uint16_t> query_bf16_buf;
+        if (use_bf16_batch) {
+            query_bf16_buf.resize(dim);
+            convertFloatVectorToBf16(
+                reinterpret_cast<const float*>(data_point),
+                query_bf16_buf.data(), dim);
+        }
 
         while (!candidate_set.empty()) {
             std::pair<dist_t, tableint> current_node_pair = candidate_set.top();
@@ -367,6 +842,10 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                 metric_distance_computations+=size;
             }
 
+            // Collect unvisited candidates into pre-allocated buffer (no heap alloc).
+            size_t pending_count = 0;
+            size_t profiled_count = 0;
+
 #ifdef USE_SSE
             _mm_prefetch((char *) (visited_array + *(data + 1)), _MM_HINT_T0);
             _mm_prefetch((char *) (visited_array + *(data + 1) + 64), _MM_HINT_T0);
@@ -376,62 +855,94 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
             for (size_t j = 1; j <= size; j++) {
                 int candidate_id = *(data + j);
-//                    if (candidate_id == 0) continue;
 #ifdef USE_SSE
                 _mm_prefetch((char *) (visited_array + *(data + j + 1)), _MM_HINT_T0);
                 _mm_prefetch(data_level0_memory_ + (*(data + j + 1)) * size_data_per_element_ + offsetData_,
-                                _MM_HINT_T0);  ////////////
+                                _MM_HINT_T0);
 #endif
                 if (!(visited_array[candidate_id] == visited_array_tag)) {
                     visited_array[candidate_id] = visited_array_tag;
-
-                    char *currObj1 = (getDataByInternalId(candidate_id));
-                    dist_t dist = fstdistfunc_(data_point, currObj1, dist_func_param_);
-
-                    bool flag_consider_candidate;
-                    if (!bare_bone_search && stop_condition) {
-                        flag_consider_candidate = stop_condition->should_consider_candidate(dist, lowerBound);
-                    } else {
-                        flag_consider_candidate = top_candidates.size() < ef || lowerBound > dist;
+                    pending_ids_buf[pending_count++] = candidate_id;
+                    if (search_profile) {
+                        profiled_ids_buf[profiled_count++] = candidate_id;
                     }
+                }
+            }
 
-                    if (flag_consider_candidate) {
-                        candidate_set.emplace(-dist, candidate_id);
+            // Batch BF16 distance computation using cached query and pre-allocated buffers.
+            if (use_bf16_batch && pending_count > 0) {
+                computeBf16BatchDistancesInto(
+                    query_bf16_buf.data(),
+                    pending_ids_buf.data(),
+                    pending_dists_buf.data(),
+                    pending_count);
+                if (search_profile) {
+                    search_profile->recordDistanceComputation(pending_count);
+                }
+            }
+
+            for (size_t i = 0; i < pending_count; i++) {
+                tableint candidate_id = pending_ids_buf[i];
+                char *currObj1 = (getDataByInternalId(candidate_id));
+                dist_t dist;
+                if (use_bf16_batch) {
+                    dist = pending_dists_buf[i];
+                } else {
+                    dist = fstdistfunc_(data_point, currObj1, dist_func_param_);
+                    if (search_profile) {
+                        search_profile->recordDistanceComputation();
+                    }
+                }
+
+                bool flag_consider_candidate;
+                if (!bare_bone_search && stop_condition) {
+                    flag_consider_candidate = stop_condition->should_consider_candidate(dist, lowerBound);
+                } else {
+                    flag_consider_candidate = top_candidates.size() < ef || lowerBound > dist;
+                }
+
+                if (flag_consider_candidate) {
+                    candidate_set.emplace(-dist, candidate_id);
 #ifdef USE_SSE
-                        _mm_prefetch(data_level0_memory_ + candidate_set.top().second * size_data_per_element_ +
-                                        offsetLevel0_,  ///////////
-                                        _MM_HINT_T0);  ////////////////////////
+                    _mm_prefetch(data_level0_memory_ + candidate_set.top().second * size_data_per_element_ +
+                                    offsetLevel0_,
+                                    _MM_HINT_T0);
 #endif
 
-                        if (bare_bone_search || 
-                            (!isMarkedDeleted(candidate_id) && ((!isIdAllowed) || (*isIdAllowed)(getExternalLabel(candidate_id))))) {
-                            top_candidates.emplace(dist, candidate_id);
-                            if (!bare_bone_search && stop_condition) {
-                                stop_condition->add_point_to_result(getExternalLabel(candidate_id), currObj1, dist);
-                            }
-                        }
-
-                        bool flag_remove_extra = false;
+                    if (bare_bone_search ||
+                        (!isMarkedDeleted(candidate_id) && ((!isIdAllowed) || (*isIdAllowed)(getExternalLabel(candidate_id))))) {
+                        top_candidates.emplace(dist, candidate_id);
                         if (!bare_bone_search && stop_condition) {
+                            stop_condition->add_point_to_result(getExternalLabel(candidate_id), currObj1, dist);
+                        }
+                    }
+
+                    bool flag_remove_extra = false;
+                    if (!bare_bone_search && stop_condition) {
+                        flag_remove_extra = stop_condition->should_remove_extra();
+                    } else {
+                        flag_remove_extra = top_candidates.size() > ef;
+                    }
+                    while (flag_remove_extra) {
+                        tableint id = top_candidates.top().second;
+                        top_candidates.pop();
+                        if (!bare_bone_search && stop_condition) {
+                            stop_condition->remove_point_from_result(getExternalLabel(id), getDataByInternalId(id), dist);
                             flag_remove_extra = stop_condition->should_remove_extra();
                         } else {
                             flag_remove_extra = top_candidates.size() > ef;
                         }
-                        while (flag_remove_extra) {
-                            tableint id = top_candidates.top().second;
-                            top_candidates.pop();
-                            if (!bare_bone_search && stop_condition) {
-                                stop_condition->remove_point_from_result(getExternalLabel(id), getDataByInternalId(id), dist);
-                                flag_remove_extra = stop_condition->should_remove_extra();
-                            } else {
-                                flag_remove_extra = top_candidates.size() > ef;
-                            }
-                        }
-
-                        if (!top_candidates.empty())
-                            lowerBound = top_candidates.top().first;
                     }
+
+                    if (!top_candidates.empty())
+                        lowerBound = top_candidates.top().first;
                 }
+            }
+
+            if (search_profile) {
+                search_profile->recordBaseLayerExpansion(
+                    std::vector<tableint>(profiled_ids_buf.begin(),
+                                          profiled_ids_buf.begin() + profiled_count));
             }
         }
 
@@ -653,6 +1164,9 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         linkLists_ = linkLists_new;
 
         max_elements_ = new_max_elements;
+        if (use_bf16_rowmajor_batch_distance_) {
+            rebuildBf16RowmajorData();
+        }
     }
 
     size_t indexFileSize() const {
@@ -815,6 +1329,10 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             }
         }
 
+        if (use_bf16_rowmajor_batch_distance_) {
+            rebuildBf16RowmajorData();
+        }
+
         input.close();
 
         return;
@@ -823,6 +1341,9 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
     template<typename data_t>
     std::vector<data_t> getDataByLabel(labeltype label) const {
+        if (fp32_vectors_released_) {
+            throw std::runtime_error("Cannot retrieve FP32 vectors after storage has been released");
+        }
         // lock all operations with element by label
         std::unique_lock <std::mutex> lock_label(getLabelOpMutex(label));
         
@@ -951,6 +1472,9 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     * If replacement of deleted elements is enabled: replaces previously deleted point if any, updating it with new point
     */
     void addPoint(const void *data_point, labeltype label, bool replace_deleted = false) {
+        if (fp32_vectors_released_) {
+            throw std::runtime_error("Cannot add points after FP32 vector storage has been released");
+        }
         if ((allow_replace_deleted_ == false) && (replace_deleted == true)) {
             throw std::runtime_error("Replacement of deleted elements is disabled in constructor");
         }
@@ -992,8 +1516,12 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
 
     void updatePoint(const void *dataPoint, tableint internalId, float updateNeighborProbability) {
+        if (fp32_vectors_released_) {
+            throw std::runtime_error("Cannot update points after FP32 vector storage has been released");
+        }
         // update the feature vector associated with existing point with new vector
         memcpy(getDataByInternalId(internalId), dataPoint, data_size_);
+        refreshBf16RowmajorElement(internalId);
 
         int maxLevelCopy = maxlevel_;
         tableint entryPointCopy = enterpoint_node_;
@@ -1201,6 +1729,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         // Initialisation of the data and label
         memcpy(getExternalLabeLp(cur_c), &label, sizeof(labeltype));
         memcpy(getDataByInternalId(cur_c), data_point, data_size_);
+        refreshBf16RowmajorElement(cur_c);
 
         if (curlevel) {
             linkLists_[cur_c] = (char *) malloc(size_links_per_element_ * curlevel + 1);
@@ -1266,13 +1795,21 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     }
 
 
+ private:
     std::priority_queue<std::pair<dist_t, labeltype >>
-    searchKnn(const void *query_data, size_t k, BaseFilterFunctor* isIdAllowed = nullptr) const {
+    searchKnnInternal(
+        const void *query_data,
+        size_t k,
+        BaseFilterFunctor* isIdAllowed,
+        SearchProfileStats* search_profile) const {
         std::priority_queue<std::pair<dist_t, labeltype >> result;
         if (cur_element_count == 0) return result;
 
         tableint currObj = enterpoint_node_;
-        dist_t curdist = fstdistfunc_(query_data, getDataByInternalId(enterpoint_node_), dist_func_param_);
+        dist_t curdist = computeDistanceSingle(query_data, enterpoint_node_);
+        if (search_profile) {
+            search_profile->recordDistanceComputation();
+        }
 
         for (int level = maxlevel_; level > 0; level--) {
             bool changed = true;
@@ -1290,7 +1827,10 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                     tableint cand = datal[i];
                     if (cand < 0 || cand > max_elements_)
                         throw std::runtime_error("cand error");
-                    dist_t d = fstdistfunc_(query_data, getDataByInternalId(cand), dist_func_param_);
+                    dist_t d = computeDistanceSingle(query_data, cand);
+                    if (search_profile) {
+                        search_profile->recordDistanceComputation();
+                    }
 
                     if (d < curdist) {
                         curdist = d;
@@ -1305,10 +1845,10 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         bool bare_bone_search = !num_deleted_ && !isIdAllowed;
         if (bare_bone_search) {
             top_candidates = searchBaseLayerST<true>(
-                    currObj, query_data, std::max(ef_, k), isIdAllowed);
+                    currObj, query_data, std::max(ef_, k), isIdAllowed, nullptr, search_profile);
         } else {
             top_candidates = searchBaseLayerST<false>(
-                    currObj, query_data, std::max(ef_, k), isIdAllowed);
+                    currObj, query_data, std::max(ef_, k), isIdAllowed, nullptr, search_profile);
         }
 
         while (top_candidates.size() > k) {
@@ -1322,6 +1862,22 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         return result;
     }
 
+ public:
+    std::priority_queue<std::pair<dist_t, labeltype >>
+    searchKnn(const void *query_data, size_t k, BaseFilterFunctor* isIdAllowed = nullptr) const {
+        return searchKnnInternal(query_data, k, isIdAllowed, nullptr);
+    }
+
+    std::priority_queue<std::pair<dist_t, labeltype >>
+    searchKnnProfiled(
+        const void *query_data,
+        size_t k,
+        SearchProfileStats& search_profile,
+        BaseFilterFunctor* isIdAllowed = nullptr) const {
+        search_profile = SearchProfileStats();
+        return searchKnnInternal(query_data, k, isIdAllowed, &search_profile);
+    }
+
 
     std::vector<std::pair<dist_t, labeltype >>
     searchStopConditionClosest(
@@ -1332,7 +1888,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         if (cur_element_count == 0) return result;
 
         tableint currObj = enterpoint_node_;
-        dist_t curdist = fstdistfunc_(query_data, getDataByInternalId(enterpoint_node_), dist_func_param_);
+        dist_t curdist = computeDistanceSingle(query_data, enterpoint_node_);
 
         for (int level = maxlevel_; level > 0; level--) {
             bool changed = true;
@@ -1350,7 +1906,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                     tableint cand = datal[i];
                     if (cand < 0 || cand > max_elements_)
                         throw std::runtime_error("cand error");
-                    dist_t d = fstdistfunc_(query_data, getDataByInternalId(cand), dist_func_param_);
+                    dist_t d = computeDistanceSingle(query_data, cand);
 
                     if (d < curdist) {
                         curdist = d;
