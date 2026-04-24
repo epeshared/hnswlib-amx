@@ -813,7 +813,9 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                 reinterpret_cast<const float*>(data_point),
                 query_bf16_buf.data(), dim);
         }
-
+        // In BF16 batch mode, redirect neighbor-loop prefetch from the unused
+        // data_level0_memory_ payload to the bf16_rowmajor_data_ vector store.
+        const uint16_t* bf16_pf_base = use_bf16_batch ? bf16_rowmajor_data_.data() : nullptr;
         while (!candidate_set.empty()) {
             std::pair<dist_t, tableint> current_node_pair = candidate_set.top();
             dist_t candidate_dist = -current_node_pair.first;
@@ -849,7 +851,11 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 #ifdef USE_SSE
             _mm_prefetch((char *) (visited_array + *(data + 1)), _MM_HINT_T0);
             _mm_prefetch((char *) (visited_array + *(data + 1) + 64), _MM_HINT_T0);
-            _mm_prefetch(data_level0_memory_ + (*(data + 1)) * size_data_per_element_ + offsetData_, _MM_HINT_T0);
+            if (use_bf16_batch) {
+                _mm_prefetch((const char*)(bf16_pf_base + (size_t)(*(data + 1)) * dim), _MM_HINT_T1);
+            } else {
+                _mm_prefetch(data_level0_memory_ + (*(data + 1)) * size_data_per_element_ + offsetData_, _MM_HINT_T0);
+            }
             _mm_prefetch((char *) (data + 2), _MM_HINT_T0);
 #endif
 
@@ -857,8 +863,12 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                 int candidate_id = *(data + j);
 #ifdef USE_SSE
                 _mm_prefetch((char *) (visited_array + *(data + j + 1)), _MM_HINT_T0);
-                _mm_prefetch(data_level0_memory_ + (*(data + j + 1)) * size_data_per_element_ + offsetData_,
-                                _MM_HINT_T0);
+                if (use_bf16_batch) {
+                    _mm_prefetch((const char*)(bf16_pf_base + (size_t)(*(data + j + 1)) * dim), _MM_HINT_T1);
+                } else {
+                    _mm_prefetch(data_level0_memory_ + (*(data + j + 1)) * size_data_per_element_ + offsetData_,
+                                    _MM_HINT_T0);
+                }
 #endif
                 if (!(visited_array[candidate_id] == visited_array_tag)) {
                     visited_array[candidate_id] = visited_array_tag;

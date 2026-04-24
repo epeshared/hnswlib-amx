@@ -115,6 +115,9 @@ if(HNSWLIB_EXAMPLES)
     add_executable(amx_bf16_bench tests/cpp/amx_bf16_bench.cpp)
     target_link_libraries(amx_bf16_bench hnswlib)
 
+    add_executable(amx_bf16_mt_bench tests/cpp/amx_bf16_mt_bench.cpp)
+    target_link_libraries(amx_bf16_mt_bench hnswlib pthread)
+
     add_executable(multiThreadLoad_test tests/cpp/multiThreadLoad_test.cpp)
     target_link_libraries(multiThreadLoad_test hnswlib)
 
