@@ -181,6 +181,10 @@ class Index {
     hnswlib::SpaceInterface<float>* l2space;
 
 
+    // Search mode: auto-switch based on input dtype, or force BF16/FP32.
+    enum class SearchMode { Auto, Bf16, Fp32 };
+    SearchMode search_mode_ = SearchMode::Auto;
+
     Index(const std::string &space_name, const int dim) : space_name(space_name), dim(dim) {
         normalize = false;
         if (space_name == "l2") {
@@ -275,6 +279,26 @@ class Index {
         return index_inited && appr_alg->getAmxBf16();
     }
 
+
+
+
+    void setSearchMode(const std::string& mode) {
+        if (mode == "auto") {
+            search_mode_ = SearchMode::Auto;
+        } else if (mode == "bf16") {
+            search_mode_ = SearchMode::Bf16;
+        } else if (mode == "fp32") {
+            search_mode_ = SearchMode::Fp32;
+        } else {
+            throw std::runtime_error("Search mode must be 'auto', 'bf16', or 'fp32'.");
+        }
+    }
+
+    std::string getSearchMode() const {
+        if (search_mode_ == SearchMode::Auto) return "auto";
+        if (search_mode_ == SearchMode::Bf16) return "bf16";
+        return "fp32";
+    }
 
     void set_num_threads(int num_threads) {
         this->num_threads_default = num_threads;
@@ -676,7 +700,53 @@ class Index {
         size_t k = 1,
         int num_threads = -1,
         const std::function<bool(hnswlib::labeltype)>& filter = nullptr) {
-        py::array_t < dist_t, py::array::c_style | py::array::forcecast > items(input);
+        // Auto-detect input dtype and switch search mode if in Auto mode.
+        // np.uint16 -> BF16 search path (reconstruct float32 from BF16 bits).
+        // np.float32 -> FP32 search path.
+        bool is_uint16_input = false;
+        {
+            py::object input_dtype = input.attr("dtype");
+            std::string dtype_name = py::str(input_dtype.attr("name"));
+            is_uint16_input = (dtype_name == "uint16");
+        }
+
+        bool use_bf16_query = false;
+        if (search_mode_ == SearchMode::Auto) {
+            use_bf16_query = is_uint16_input;
+        } else if (search_mode_ == SearchMode::Bf16) {
+            use_bf16_query = true;
+        }
+
+        // For uint16 BF16 input, convert to float32 by reconstructing the float
+        // from BF16 bits (shift left 16 bits), NOT numerical forcecast.
+        // This ensures convertFloatVectorToBf16 recovers the original BF16 values.
+        py::object data_obj;
+        py::array_t<float> bf16_reconstructed;
+        std::vector<ssize_t> bf16_shape;
+        if (is_uint16_input) {
+            py::array_t<uint16_t> bf16_input = py::cast<py::array_t<uint16_t>>(input);
+            auto bf16_buf = bf16_input.request();
+            bf16_shape.assign(bf16_buf.shape.begin(), bf16_buf.shape.end());
+            bf16_reconstructed = py::array_t<float>(bf16_buf.size);
+            auto f32_buf = bf16_reconstructed.request();
+            const uint16_t* bf16_ptr = static_cast<const uint16_t*>(bf16_buf.ptr);
+            float* f32_ptr = static_cast<float*>(f32_buf.ptr);
+            size_t total = bf16_buf.size;
+            for (size_t i = 0; i < total; i++) {
+                uint32_t bits = static_cast<uint32_t>(bf16_ptr[i]) << 16;
+                memcpy(&f32_ptr[i], &bits, sizeof(float));
+            }
+            // Reshape to match the original uint16 array shape.
+            std::string format = py::str(bf16_input.attr("dtype").attr("str"));
+            if (bf16_shape.size() == 2) {
+                bf16_reconstructed.resize(bf16_shape);
+            }
+            data_obj = bf16_reconstructed;
+        } else {
+            data_obj = input;
+        }
+
+        py::array_t < dist_t, py::array::c_style | py::array::forcecast > items(data_obj);
         auto buffer = items.request();
         hnswlib::labeltype* data_numpy_l;
         dist_t* data_numpy_d;
@@ -700,6 +770,15 @@ class Index {
             // Warning: search with a filter works slow in python in multithreaded mode. For best performance set num_threads=1
             CustomFilterFunctor idFilter(filter);
             CustomFilterFunctor* p_idFilter = filter ? &idFilter : nullptr;
+
+            // Auto-enable BF16 mode if input is uint16 and BF16 is not yet active.
+            bool was_bf16_enabled = false;
+            if (use_bf16_query && index_inited && appr_alg) {
+                was_bf16_enabled = appr_alg->getBf16RowmajorBatchDistance();
+                if (!was_bf16_enabled) {
+                    appr_alg->setBf16RowmajorBatchDistance(true);
+                }
+            }
 
             if (normalize == false) {
                 ParallelFor(0, rows, num_threads, [&](size_t row, size_t threadId) {
@@ -764,7 +843,45 @@ class Index {
         size_t k = 1,
         int num_threads = -1,
         const std::function<bool(hnswlib::labeltype)>& filter = nullptr) {
-        py::array_t < dist_t, py::array::c_style | py::array::forcecast > items(input);
+        bool is_uint16_input = false;
+        {
+            py::object input_dtype = input.attr("dtype");
+            std::string dtype_name = py::str(input_dtype.attr("name"));
+            is_uint16_input = (dtype_name == "uint16");
+        }
+
+        bool use_bf16_query = false;
+        if (search_mode_ == SearchMode::Auto) {
+            use_bf16_query = is_uint16_input;
+        } else if (search_mode_ == SearchMode::Bf16) {
+            use_bf16_query = true;
+        }
+
+        py::object data_obj;
+        py::array_t<float> bf16_reconstructed;
+        std::vector<ssize_t> bf16_shape;
+        if (is_uint16_input) {
+            py::array_t<uint16_t> bf16_input = py::cast<py::array_t<uint16_t>>(input);
+            auto bf16_buf = bf16_input.request();
+            bf16_shape.assign(bf16_buf.shape.begin(), bf16_buf.shape.end());
+            bf16_reconstructed = py::array_t<float>(bf16_buf.size);
+            auto f32_buf = bf16_reconstructed.request();
+            const uint16_t* bf16_ptr = static_cast<const uint16_t*>(bf16_buf.ptr);
+            float* f32_ptr = static_cast<float*>(f32_buf.ptr);
+            size_t total = bf16_buf.size;
+            for (size_t i = 0; i < total; i++) {
+                uint32_t bits = static_cast<uint32_t>(bf16_ptr[i]) << 16;
+                memcpy(&f32_ptr[i], &bits, sizeof(float));
+            }
+            if (bf16_shape.size() == 2) {
+                bf16_reconstructed.resize(bf16_shape);
+            }
+            data_obj = bf16_reconstructed;
+        } else {
+            data_obj = input;
+        }
+
+        py::array_t < dist_t, py::array::c_style | py::array::forcecast > items(data_obj);
         auto buffer = items.request();
         hnswlib::labeltype* data_numpy_l;
         dist_t* data_numpy_d;
@@ -789,6 +906,12 @@ class Index {
 
             CustomFilterFunctor idFilter(filter);
             CustomFilterFunctor* p_idFilter = filter ? &idFilter : nullptr;
+
+            if (use_bf16_query && index_inited && appr_alg) {
+                if (!appr_alg->getBf16RowmajorBatchDistance()) {
+                    appr_alg->setBf16RowmajorBatchDistance(true);
+                }
+            }
 
             if (normalize == false) {
                 ParallelFor(0, rows, num_threads, [&](size_t row, size_t threadId) {
@@ -1127,6 +1250,8 @@ PYBIND11_PLUGIN(hnswlib) {
         .def("is_fp32_vectors_released", &Index<float>::is_fp32_vectors_released)
         .def("set_amx_bf16", &Index<float>::set_amx_bf16, py::arg("enabled") = true)
         .def("get_amx_bf16", &Index<float>::get_amx_bf16)
+        .def("set_search_mode", &Index<float>::setSearchMode, py::arg("mode"))
+        .def("get_search_mode", &Index<float>::getSearchMode)
         .def("set_num_threads", &Index<float>::set_num_threads, py::arg("num_threads"))
         .def("index_file_size", &Index<float>::indexFileSize)
         .def("save_index", &Index<float>::saveIndex, py::arg("path_to_index"))
