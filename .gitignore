@@ -11,3 +11,6 @@ var/
 .vs/
 **.DS_Store
 *.pyc
+build-*
+*.so
+CLAUDE.md

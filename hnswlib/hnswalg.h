@@ -313,16 +313,49 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     // Requires BF16 mode to be enabled. After this call:
     //   - Search uses BF16 data only (already the case when BF16 is enabled)
     //   - addPoint / updatePoint / getData will throw
-    //   - Index can still be saved (links + labels preserved, vectors zeroed)
+    //   - Index can be saved (links + labels preserved in compact form)
     void releaseFp32VectorStorage() {
         if (!use_bf16_rowmajor_batch_distance_ || bf16_rowmajor_data_.empty()) {
             throw std::runtime_error(
                 "Cannot release FP32 vectors: BF16 row-major batch distance must be enabled first");
         }
-        // Zero out vector data in data_level0_memory_, keep links and labels.
-        for (tableint i = 0; i < cur_element_count; i++) {
-            memset(getDataByInternalId(i), 0, data_size_);
+        if (fp32_vectors_released_) {
+            return;
         }
+
+        // Compute new compact layout: links + labels only (no FP32 vectors).
+        size_t size_data_per_element_new = size_links_level0_ + sizeof(labeltype);
+        size_t new_total = max_elements_ * size_data_per_element_new;
+
+        char* data_level0_new = (char*)malloc(new_total);
+        if (data_level0_new == nullptr) {
+            throw std::runtime_error("Not enough memory for compact data_level0 reallocation");
+        }
+
+        // Copy links and labels from old layout to new compact layout.
+        // Old layout per element: [links size_links_level0_][FP32 data_size_][label sizeof(labeltype)]
+        // New layout per element: [links size_links_level0_][label sizeof(labeltype)]
+        for (tableint i = 0; i <= cur_element_count && (size_t)i < max_elements_; i++) {
+            char* old_elem = data_level0_memory_ + i * size_data_per_element_;
+            char* new_elem = data_level0_new + i * size_data_per_element_new;
+
+            // Copy links (at offset 0 in both layouts)
+            memcpy(new_elem, old_elem, size_links_level0_);
+
+            // Copy label (at label_offset_ in old, size_links_level0_ in new)
+            memcpy(new_elem + size_links_level0_,
+                   old_elem + label_offset_,
+                   sizeof(labeltype));
+        }
+
+        free(data_level0_memory_);
+        data_level0_memory_ = data_level0_new;
+
+        // Update offsets and sizes to reflect new compact layout.
+        offsetData_ = size_links_level0_;  // no FP32 data region
+        label_offset_ = size_links_level0_;
+        size_data_per_element_ = size_data_per_element_new;
+
         fp32_vectors_released_ = true;
     }
 
@@ -1193,6 +1226,12 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             size += sizeof(linkListSize);
             size += linkListSize;
         }
+
+        // Optional BF16 block: magic(4) + dim(8) + count(8) + data(cur_element_count * dim * 2)
+        if (use_bf16_rowmajor_batch_distance_ && !bf16_rowmajor_data_.empty()) {
+            size += 4 + 8 + 8 + bf16_rowmajor_data_.size() * sizeof(uint16_t);
+        }
+
         return size;
     }
 
@@ -1222,6 +1261,20 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             if (linkListSize)
                 output.write(linkLists_[i], linkListSize);
         }
+
+        // Append optional BF16 block for fast recovery after loadIndex.
+        // Format: magic(4) + dim(8) + count(8) + data(count * 2 bytes)
+        if (use_bf16_rowmajor_batch_distance_ && !bf16_rowmajor_data_.empty()) {
+            const uint32_t BF16_MAGIC = 0x42463136;  // "BF16" in ASCII
+            writeBinaryPOD(output, BF16_MAGIC);
+
+            size_t dim = getDistanceDim();
+            uint64_t count = bf16_rowmajor_data_.size();
+            writeBinaryPOD(output, dim);
+            writeBinaryPOD(output, count);
+            output.write(reinterpret_cast<const char*>(bf16_rowmajor_data_.data()), count * sizeof(uint16_t));
+        }
+
         output.close();
     }
 
@@ -1278,8 +1331,34 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             }
         }
 
+        // Check for optional BF16 block at end of file.
+        // BF16 block format: magic(4) + dim(8) + count(8) + data(count * 2 bytes)
+        bool has_bf16_block = false;
+        size_t bf16_data_count = 0;
+        size_t bf16_block_dim = 0;
+        std::streampos bf16_block_pos;
+
+        std::streampos data_end_pos = input.tellg();
+        if (data_end_pos < total_filesize) {
+            // There is extra data at the end - check for BF16 block
+            input.seekg(data_end_pos);
+            const uint32_t BF16_MAGIC = 0x42463136;
+            uint32_t magic;
+            readBinaryPOD(input, magic);
+            if (magic == BF16_MAGIC) {
+                uint64_t dim64, count64;
+                readBinaryPOD(input, dim64);
+                readBinaryPOD(input, count64);
+                bf16_block_dim = static_cast<size_t>(dim64);
+                bf16_data_count = static_cast<size_t>(count64);
+                bf16_block_pos = input.tellg();
+                has_bf16_block = true;
+            }
+        }
+
         // throw exception if it either corrupted or old index
-        if (input.tellg() != total_filesize)
+        // Allow extra data only if it's a valid BF16 block
+        if (input.tellg() < 0 || input.tellg() > total_filesize)
             throw std::runtime_error("Index seems to be corrupted or unsupported");
 
         input.clear();
@@ -1331,6 +1410,20 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
         if (use_bf16_rowmajor_batch_distance_) {
             rebuildBf16RowmajorData();
+        } else if (has_bf16_block) {
+            // BF16 block was present in the file. Load it directly.
+            bf16_rowmajor_data_.resize(bf16_data_count);
+            input.seekg(bf16_block_pos);
+            input.read(reinterpret_cast<char*>(bf16_rowmajor_data_.data()), bf16_data_count * sizeof(uint16_t));
+            use_bf16_rowmajor_batch_distance_ = true;
+        }
+
+        // Detect compact layout (FP32 vectors were released before save).
+        // When size_data_per_element_ from file is smaller than the full layout,
+        // set fp32_vectors_released_ to prevent add_items/get_data.
+        size_t expected_full_size = size_links_level0_ + data_size_ + sizeof(labeltype);
+        if (size_data_per_element_ < expected_full_size) {
+            fp32_vectors_released_ = true;
         }
 
         input.close();
